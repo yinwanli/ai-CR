@@ -4,7 +4,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 
 from app.database import get_db, SessionLocal
@@ -21,6 +21,7 @@ from app.services.jira_service import jira_service
 from app.services.diff_parser import diff_parser
 from app.services.ai_analyzer import ai_analyzer
 from app.services.mock_data import MockDataService
+from app.services.github_service import github_service
 from app.utils.jira_parser import extract_jira_key
 from app.config import settings
 from app.utils.logger import get_logger
@@ -85,16 +86,14 @@ async def submit_analysis(
 
         logger.info(f"Created analysis task: id={task.id}, release_no={request.release_no}")
 
-        # 获取mock diff内容（实际应用中应从其他来源获取）
-        diff_content = MockDataService.get_mock_diff("git")
-
-        # 启动后台任务
+        # 启动后台任务（diff 在后台按 head/base 从 GitHub compare 拉取）
         background_tasks.add_task(
             run_analysis,
             task_id=task.id,
             release_no=request.release_no,
             jira_key=jira_key,
-            diff_content=diff_content
+            head_sha=request.head_sha,
+            base_sha=request.base_sha,
         )
 
         return Response(
@@ -228,24 +227,57 @@ async def get_history(
         return Response(code=500, message=f"Failed to get history: {str(e)}")
 
 
-def run_analysis(task_id: int, release_no: str, jira_key: str, diff_content: str):
+def _load_diff_content(
+    release_no: str,
+    head_sha: Optional[str] = None,
+    base_sha: Optional[str] = None,
+) -> str:
+    """本版本相对分支上一版的 GitHub compare diff；无 head 或未配置时回退 mock。"""
+    ref = (head_sha or release_no or "").strip()
+    if not ref:
+        logger.warning("No head_sha/release_no for GitHub, using mock diff")
+        return MockDataService.get_mock_diff("git")
+
+    if not github_service.is_configured:
+        logger.warning("GITHUB_REPO not configured, using mock diff")
+        return MockDataService.get_mock_diff("git")
+
+    diff_text, head, base = github_service.get_release_diff(ref, base_sha=base_sha)
+    logger.info(
+        "Loaded GitHub compare diff %s...%s (%d bytes)",
+        base[:7],
+        head[:7],
+        len(diff_text),
+    )
+    return diff_text
+
+
+def run_analysis(
+    task_id: int,
+    release_no: str,
+    jira_key: str,
+    head_sha: Optional[str] = None,
+    base_sha: Optional[str] = None,
+):
     """
     执行分析的后台任务
 
     完整的分析流程:
     1. 更新任务状态为 ANALYZING
-    2. 获取需求文档
-    3. 解析代码diff
-    4. 过滤文件（后端/前端）
-    5. 调用AI分析
-    6. 创建分析报告
-    7. 更新任务状态为 SUCCESS 或 FAILED
+    2. 从 GitHub 拉取本版 vs 上一版 diff
+    3. 获取需求文档
+    4. 解析代码diff
+    5. 过滤文件（后端/前端）
+    6. 调用AI分析
+    7. 创建分析报告
+    8. 更新任务状态为 SUCCESS 或 FAILED
 
     Args:
         task_id: 任务ID
-        release_no: 上线单号
+        release_no: 发布版本标识
         jira_key: Jira单号
-        diff_content: diff内容
+        head_sha: 本版本 commit
+        base_sha: 上一版本 commit（可选，缺省则取分支上下一条）
     """
     # 创建新的数据库会话（后台任务需要独立的会话）
     db = SessionLocal()
@@ -263,7 +295,23 @@ def run_analysis(task_id: int, release_no: str, jira_key: str, diff_content: str
         db.commit()
         logger.info(f"Task {task_id} status updated to ANALYZING")
 
-        # 2. 获取需求文档
+        # 2. GitHub compare diff（本版 vs 分支上一版）
+        try:
+            diff_content = _load_diff_content(release_no, head_sha=head_sha, base_sha=base_sha)
+        except ValueError as e:
+            logger.error("GitHub diff error: %s", e)
+            task.status = TaskStatus.FAILED
+            task.error_message = str(e)
+            db.commit()
+            return
+        except Exception as e:
+            logger.error("Failed to load GitHub diff: %s", e, exc_info=True)
+            task.status = TaskStatus.FAILED
+            task.error_message = f"Failed to load GitHub diff: {e}"
+            db.commit()
+            return
+
+        # 3. 获取需求文档
         requirement_doc = ""
         if jira_key:
             logger.info(f"Fetching requirement document for jira_key={jira_key}")
@@ -272,7 +320,7 @@ def run_analysis(task_id: int, release_no: str, jira_key: str, diff_content: str
             logger.warning(f"No jira_key extracted from release_no: {release_no}")
             requirement_doc = "# 需求文档\n\n未找到关联的Jira需求文档。"
 
-        # 3. 解析diff内容
+        # 4. 解析diff内容
         logger.info("Parsing diff content...")
         files = diff_parser.parse_diff(diff_content, diff_type="git")
         if not files:

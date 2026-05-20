@@ -104,13 +104,7 @@ class AIAnalyzer:
 
         try:
             prompt = build_analyze_prompt(requirement_doc, code_diff)
-
-            if self.use_cursor_agent:
-                logger.info(f"Calling Cursor Cloud Agent (model={self.cursor_model})")
-                response = self._call_cursor_agent(prompt)
-            else:
-                logger.info(f"Calling Claude API with model {self.model}")
-                response = self._call_claude_api(prompt)
+            response = self._call_llm(prompt, purpose="analyze")
 
             if not response:
                 logger.error(f"Empty response from backend={self.backend}")
@@ -141,39 +135,54 @@ class AIAnalyzer:
             需要额外读取的文件路径列表
         """
         if self.mock_mode:
-            # Mock模式下返回空列表或简单的启发式选择
-            return self._heuristic_file_selection(changed_files, diff)
-
-        if self.use_cursor_agent:
-            # Cursor cloud agent 直接 clone 仓库自己看代码,
-            # 无需上层手动挑上下文文件; 这里直接退回启发式或空表即可。
             return self._heuristic_file_selection(changed_files, diff)
 
         try:
-            # 构建提示词
             prompt = build_context_selection_prompt(changed_files, diff)
-
-            # 调用Claude API
-            response = self._call_claude_api(prompt)
+            response = self._call_llm(prompt, purpose="select_context_files")
 
             if not response:
-                logger.warning("Empty response for context selection, using heuristic")
+                logger.warning(
+                    "Empty response for context selection (backend=%s), using heuristic",
+                    self.backend,
+                )
                 return self._heuristic_file_selection(changed_files, diff)
 
-            # 解析JSON响应
             result = self._extract_json(response)
 
             if not result or "required_files" not in result:
-                logger.warning("Invalid response for context selection, using heuristic")
+                logger.warning(
+                    "Invalid context selection JSON (backend=%s), using heuristic",
+                    self.backend,
+                )
                 return self._heuristic_file_selection(changed_files, diff)
 
             files = result.get("required_files", [])
-            # 限制最大文件数量
-            return files[:self.max_context_files]
+            return files[: self.max_context_files]
 
         except Exception as e:
             logger.error(f"Error selecting context files: {e}", exc_info=True)
             return self._heuristic_file_selection(changed_files, diff)
+
+    def _call_llm(self, prompt: str, purpose: str = "analyze") -> Optional[str]:
+        """
+        按当前 backend 调用 LLM（Cursor Cloud Agent 或 Claude API）。
+
+        Args:
+            prompt: 提示词
+            purpose: 日志用途标识，如 analyze / select_context_files
+        """
+        if self.mock_mode:
+            return None
+        if self.use_cursor_agent:
+            logger.info(
+                "Calling Cursor Cloud Agent for %s (model=%s)",
+                purpose,
+                self.cursor_model,
+            )
+            return self._call_cursor_agent(prompt)
+        logger.info("Calling Claude API for %s (model=%s)", purpose, self.model)
+        return self._call_claude_api(prompt)
 
     def _call_claude_api(self, prompt: str) -> Optional[str]:
         """

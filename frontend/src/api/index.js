@@ -61,11 +61,28 @@ api.interceptors.response.use(
 
 /**
  * Analyze a release
- * @param {string} releaseNo - Release number to analyze
+ * @param {Object|string} payload - release_no string or { release_no, head_sha, base_sha }
  * @returns {Promise} Task creation result
  */
-export function analyze(releaseNo) {
-  return api.post('/analyze', { release_no: releaseNo })
+export function analyze(payload) {
+  const body =
+    typeof payload === 'string'
+      ? { release_no: payload }
+      : {
+          release_no: payload.release_no,
+          head_sha: payload.head_sha || null,
+          base_sha: payload.base_sha || null
+        }
+  return api.post('/analyze', body)
+}
+
+/**
+ * List commits on a GitHub branch (for release version dropdown)
+ * @param {string} branch - branch name
+ * @returns {Promise} { repo, branch, commits: [...] }
+ */
+export function getGithubCommits(branch) {
+  return api.get('/github/commits', { params: branch ? { branch } : {} })
 }
 
 /**

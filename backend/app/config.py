@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     CURSOR_AGENT_TIMEOUT: int = 600         # agent 最长等待时间（秒）
     CURSOR_API_BASE: str = "https://api.cursor.com/v1/agents"
 
+    # GitHub（发布版本 / diff）
+    GITHUB_REPO: str = "yinwanli/ai-CR"
+    GITHUB_DEFAULT_BRANCH: str = "main"
+    GITHUB_TOKEN: str = ""
+    GITHUB_COMMITS_LIMIT: int = 30
+
     # 认证配置
     AUTH_TOKEN: str = "demo-token"
 
