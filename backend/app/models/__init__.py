@@ -5,6 +5,7 @@
 from .task import AnalysisTask, TaskStatus
 from .report import AnalysisReport, ManualMark, ItemType
 from .config import SystemConfig
+from .ai_invocation_log import AiInvocationLog
 
 __all__ = [
     "AnalysisTask",
@@ -13,4 +14,5 @@ __all__ = [
     "ManualMark",
     "ItemType",
     "SystemConfig",
+    "AiInvocationLog",
 ]

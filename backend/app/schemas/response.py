@@ -83,3 +83,62 @@ class HistoryItem(BaseModel):
     status: str
     coverage: Optional[float] = None
     created_at: str
+
+
+class AiInvocationListItem(BaseModel):
+    """AI 调用记录列表项（不含 prompt/response 全文）"""
+    id: int
+    task_id: Optional[int] = None
+    trace_id: Optional[str] = None
+    purpose: str
+    backend: str
+    model: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
+    response_status: str
+    duration_ms: Optional[int] = None
+    prompt_chars: int
+    response_chars: Optional[int] = None
+    compare_mode: Optional[str] = None
+    caller_source: Optional[str] = None
+    run_status: Optional[str] = None
+    failure_stage: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AiInvocationDetailResponse(BaseModel):
+    """AI 调用记录详情（含全量 prompt/response）"""
+    id: int
+    task_id: Optional[int] = None
+    trace_id: Optional[str] = None
+    purpose: str
+    backend: str
+    model: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
+    response_status: str
+    duration_ms: Optional[int] = None
+    prompt_chars: int
+    response_chars: Optional[int] = None
+    compare_mode: Optional[str] = None
+    caller_source: Optional[str] = None
+    run_status: Optional[str] = None
+    failure_stage: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    created_at: Optional[str] = None
+    prompt_template: Optional[str] = None
+    prompt_version: Optional[str] = None
+    prompt_text: str
+    response_text: Optional[str] = None
+    error_message: Optional[str] = None
+    http_status: Optional[int] = None
+    external_request_id: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    release_no: Optional[str] = None
+    module_id: Optional[str] = None
+    jira_key: Optional[str] = None
+    parent_invocation_id: Optional[int] = None

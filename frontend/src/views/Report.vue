@@ -75,10 +75,19 @@
         </el-row>
       </div>
 
-      <!-- Loading State for Running Task -->
-      <div class="loading-state" v-else-if="task.status === 'running'">
-        <el-icon class="loading-icon"><Loading /></el-icon>
-        <p>分析进行中，请稍候...</p>
+      <!-- 分析中：轮询任务状态，报告未就绪 -->
+      <div class="analyzing-state" v-else-if="isInProgress">
+        <el-icon class="analyzing-icon is-loading"><Loading /></el-icon>
+        <p class="analyzing-text">分析中～</p>
+        <p class="analyzing-hint" v-if="task.progress">{{ task.progress }}</p>
+        <p class="analyzing-hint" v-else>正在拉取代码差异并进行 AI 分析，请稍候</p>
+      </div>
+
+      <!-- 成功但报告仍在加载 -->
+      <div class="analyzing-state" v-else-if="task.status === 'success' && !report">
+        <el-icon class="analyzing-icon is-loading"><Loading /></el-icon>
+        <p class="analyzing-text">分析中～</p>
+        <p class="analyzing-hint">报告生成中，请稍候</p>
       </div>
 
       <!-- Error State -->
@@ -228,6 +237,20 @@ const pageLoading = ref(true)
 const refreshing = ref(false)
 let pollingTimer = null
 
+/** 解包后端统一响应 { code, message, data } */
+const unwrapData = (res) => {
+  if (res == null) return null
+  if (typeof res === 'object' && res.data !== undefined && res.code !== undefined) {
+    return res.data
+  }
+  return res
+}
+
+const isInProgress = computed(() => {
+  const s = task.value?.status
+  return s === 'pending' || s === 'analyzing'
+})
+
 const coveragePercent = computed(() => {
   if (report.value && report.value.coverage !== null) {
     return report.value.coverage * 100
@@ -256,8 +279,8 @@ const summary = computed(() => {
 const getStatusType = (status) => {
   const types = {
     pending: 'info',
-    running: 'warning',
-    completed: 'success',
+    analyzing: 'warning',
+    success: 'success',
     failed: 'danger'
   }
   return types[status] || 'info'
@@ -266,11 +289,11 @@ const getStatusType = (status) => {
 const getStatusText = (status) => {
   const texts = {
     pending: '待处理',
-    running: '进行中',
-    completed: '已完成',
+    analyzing: '分析中',
+    success: '已完成',
     failed: '失败'
   }
-  return texts[status] || status
+  return texts[status] || '未知'
 }
 
 const getRequirementStatusText = (status) => {
@@ -322,7 +345,17 @@ const formatDate = (dateStr) => {
 
 const loadTask = async () => {
   try {
-    task.value = await getTask(taskId)
+    const res = await getTask(taskId)
+    const data = unwrapData(res)
+    if (!data) return
+    task.value = {
+      task_id: data.task_id,
+      release_no: data.release_no,
+      status: data.status,
+      created_at: data.created_at,
+      progress: data.progress,
+      error_message: data.error_message
+    }
   } catch (error) {
     ElMessage.error('获取任务信息失败')
     console.error(error)
@@ -331,8 +364,15 @@ const loadTask = async () => {
 
 const loadReport = async () => {
   try {
-    report.value = await getReport(taskId)
+    const res = await getReport(taskId)
+    const data = unwrapData(res)
+    report.value = data || null
   } catch (error) {
+    const msg = error?.message || ''
+    if (msg.includes('404') || msg.toLowerCase().includes('not found')) {
+      report.value = null
+      return
+    }
     console.error('Failed to load report:', error)
   }
 }
@@ -341,8 +381,10 @@ const refreshData = async () => {
   refreshing.value = true
   try {
     await loadTask()
-    if (task.value?.status === 'completed') {
+    if (task.value?.status === 'success') {
       await loadReport()
+    } else if (isInProgress.value) {
+      startPolling()
     }
   } finally {
     refreshing.value = false
@@ -360,13 +402,15 @@ const handleMark = async (type, id, status) => {
 }
 
 const startPolling = () => {
+  stopPolling()
   pollingTimer = setInterval(async () => {
-    if (task.value?.status === 'running' || task.value?.status === 'pending') {
-      await loadTask()
-      if (task.value?.status === 'completed') {
-        await loadReport()
-        stopPolling()
-      }
+    await loadTask()
+    if (!task.value) return
+    if (task.value.status === 'success') {
+      await loadReport()
+      stopPolling()
+    } else if (task.value.status === 'failed') {
+      stopPolling()
     }
   }, 3000)
 }
@@ -382,9 +426,10 @@ onMounted(async () => {
   try {
     pageLoading.value = true
     await loadTask()
-    if (task.value?.status === 'completed') {
+    if (!task.value) return
+    if (task.value.status === 'success') {
       await loadReport()
-    } else if (task.value?.status === 'running' || task.value?.status === 'pending') {
+    } else if (task.value.status === 'pending' || task.value.status === 'analyzing') {
       startPolling()
     }
   } finally {
@@ -487,17 +532,29 @@ onUnmounted(() => {
   font-weight: normal;
 }
 
-.loading-state,
+.analyzing-state,
 .error-state {
   text-align: center;
   padding: 60px 20px;
   color: #909399;
 }
 
-.loading-icon {
+.analyzing-icon {
   font-size: 48px;
-  animation: spin 1s linear infinite;
   color: #409eff;
+}
+
+.analyzing-text {
+  margin-top: 16px;
+  font-size: 18px;
+  font-weight: 500;
+  color: #303133;
+}
+
+.analyzing-hint {
+  margin-top: 8px;
+  font-size: 14px;
+  color: #909399;
 }
 
 .error-icon {

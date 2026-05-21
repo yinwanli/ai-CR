@@ -58,6 +58,8 @@ def init_db() -> None:
 
     创建所有表结构，需要在所有模型导入后调用
     """
+    import app.models  # noqa: F401 — 注册全部 ORM 表（含 ai_invocation_log）
+
     Base.metadata.create_all(bind=engine)
 
 

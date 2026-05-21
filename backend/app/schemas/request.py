@@ -1,12 +1,23 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
+
+CompareMode = Literal["prev_commit", "vs_master"]
 
 
 class AnalyzeRequest(BaseModel):
     """提交分析请求"""
-    release_no: str = Field(..., description="发布版本标识（如短 SHA）", min_length=1, max_length=100)
+    module_id: str = Field(..., description="代码模块 ID", min_length=1, max_length=64)
+    release_no: str = Field(..., description="发布版本标识（如短 SHA）", min_length=1, max_length=80)
     head_sha: Optional[str] = Field(None, description="本版本 commit SHA（完整或短 SHA）")
-    base_sha: Optional[str] = Field(None, description="上一版本 commit SHA，用于 compare diff")
+    base_sha: Optional[str] = Field(None, description="上一版本 commit SHA，用于相邻提交 compare")
+    compare_mode: CompareMode = Field(
+        "prev_commit",
+        description="diff 范围: prev_commit=分支相邻上一提交, vs_master=相对基线分支 tip",
+    )
+    branch: Optional[str] = Field(
+        None,
+        description="分析用分支名（在所选模块仓库上）",
+    )
 
 
 class MarkRequest(BaseModel):

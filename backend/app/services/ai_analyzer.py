@@ -6,11 +6,16 @@ import json
 import re
 import time
 import logging
-from typing import Dict, List, Any, Optional
+from datetime import datetime
+from typing import Dict, List, Any, Optional, TYPE_CHECKING
 
 from ..config import settings
 from ..utils.prompt_builder import build_analyze_prompt, build_context_selection_prompt
 from .mock_data import MockDataService
+from .ai_invocation_service import AiInvocationService, LlmInvokeOutcome
+
+if TYPE_CHECKING:
+    from .ai_invocation_context import InvocationContext
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +88,19 @@ class AIAnalyzer:
             self.backend = self.BACKEND_MOCK
             logger.info("AIAnalyzer init: backend=mock (no CURSOR_API_KEY / CLAUDE_API_KEY configured)")
 
-    def analyze(self, requirement_doc: str, code_diff: str) -> Dict[str, Any]:
+    def analyze(
+        self,
+        requirement_doc: str,
+        code_diff: str,
+        invocation_context: Optional["InvocationContext"] = None,
+    ) -> Dict[str, Any]:
         """
         分析代码变更是否满足需求
 
         Args:
             requirement_doc: 需求文档内容
             code_diff: 代码diff内容
+            invocation_context: AI 调用日志上下文（可选）
 
         Returns:
             分析结果字典，包含:
@@ -104,7 +115,11 @@ class AIAnalyzer:
 
         try:
             prompt = build_analyze_prompt(requirement_doc, code_diff)
-            response = self._call_llm(prompt, purpose="analyze")
+            response = self._call_llm(
+                prompt,
+                purpose="analyze",
+                invocation_context=invocation_context,
+            )
 
             if not response:
                 logger.error(f"Empty response from backend={self.backend}")
@@ -114,6 +129,11 @@ class AIAnalyzer:
 
             if not result:
                 logger.error(f"Failed to extract JSON from backend={self.backend} response")
+                if invocation_context and invocation_context.last_invocation_id:
+                    AiInvocationService.mark_parse_error(
+                        invocation_context.last_invocation_id,
+                        "Failed to extract JSON from analyze response",
+                    )
                 return {}
 
             logger.info(f"Analysis completed (backend={self.backend}) coverage: {result.get('coverage_percent', 'N/A')}%")
@@ -123,13 +143,19 @@ class AIAnalyzer:
             logger.error(f"Error during analysis (backend={self.backend}): {e}", exc_info=True)
             return {}
 
-    def select_context_files(self, changed_files: List[str], diff: str) -> List[str]:
+    def select_context_files(
+        self,
+        changed_files: List[str],
+        diff: str,
+        invocation_context: Optional["InvocationContext"] = None,
+    ) -> List[str]:
         """
         选择需要额外读取的上下文文件
 
         Args:
             changed_files: 已变更的文件列表
             diff: 代码diff内容
+            invocation_context: AI 调用日志上下文（可选）
 
         Returns:
             需要额外读取的文件路径列表
@@ -139,7 +165,11 @@ class AIAnalyzer:
 
         try:
             prompt = build_context_selection_prompt(changed_files, diff)
-            response = self._call_llm(prompt, purpose="select_context_files")
+            response = self._call_llm(
+                prompt,
+                purpose="select_context_files",
+                invocation_context=invocation_context,
+            )
 
             if not response:
                 logger.warning(
@@ -164,27 +194,62 @@ class AIAnalyzer:
             logger.error(f"Error selecting context files: {e}", exc_info=True)
             return self._heuristic_file_selection(changed_files, diff)
 
-    def _call_llm(self, prompt: str, purpose: str = "analyze") -> Optional[str]:
+    def _call_llm(
+        self,
+        prompt: str,
+        purpose: str = "analyze",
+        invocation_context: Optional["InvocationContext"] = None,
+    ) -> Optional[str]:
         """
         按当前 backend 调用 LLM（Cursor Cloud Agent 或 Claude API）。
 
         Args:
             prompt: 提示词
             purpose: 日志用途标识，如 analyze / select_context_files
+            invocation_context: 传入时写入 ai_invocation_log
+
+        Returns:
+            模型响应文本，失败返回 None
         """
         if self.mock_mode:
             return None
+
+        model_name = self.cursor_model if self.use_cursor_agent else self.model
+        invocation_id: Optional[int] = None
+        started_at = datetime.utcnow()
+
+        if invocation_context is not None:
+            try:
+                invocation_id = AiInvocationService.start_invocation(
+                    context=invocation_context,
+                    purpose=purpose,
+                    backend=self.backend,
+                    model=model_name,
+                    prompt_text=prompt,
+                )
+            except Exception as exc:
+                logger.warning("AI invocation log start skipped: %s", exc)
+
         if self.use_cursor_agent:
             logger.info(
                 "Calling Cursor Cloud Agent for %s (model=%s)",
                 purpose,
                 self.cursor_model,
             )
-            return self._call_cursor_agent(prompt)
-        logger.info("Calling Claude API for %s (model=%s)", purpose, self.model)
-        return self._call_claude_api(prompt)
+            outcome = self._call_cursor_agent(prompt)
+        else:
+            logger.info("Calling Claude API for %s (model=%s)", purpose, self.model)
+            outcome = self._call_claude_api(prompt)
 
-    def _call_claude_api(self, prompt: str) -> Optional[str]:
+        if invocation_id is not None:
+            try:
+                AiInvocationService.finish_invocation(invocation_id, outcome, started_at)
+            except Exception as exc:
+                logger.warning("AI invocation log finish skipped: %s", exc)
+
+        return outcome.text if outcome.text else None
+
+    def _call_claude_api(self, prompt: str) -> LlmInvokeOutcome:
         """
         调用Claude API
 
@@ -192,10 +257,11 @@ class AIAnalyzer:
             prompt: 提示词内容
 
         Returns:
-            Claude的响应文本，失败返回None
+            LlmInvokeOutcome 包含文本与 token 等元数据
         """
+        outcome = LlmInvokeOutcome()
         if self.mock_mode or not self.client:
-            return None
+            return outcome
 
         try:
             import anthropic
@@ -207,117 +273,270 @@ class AIAnalyzer:
                 messages=[
                     {
                         "role": "user",
-                        "content": prompt
+                        "content": prompt,
                     }
-                ]
+                ],
             )
 
-            # 提取响应内容
+            outcome.external_request_id = getattr(message, "id", None)
+            usage = getattr(message, "usage", None)
+            if usage is not None:
+                outcome.input_tokens = getattr(usage, "input_tokens", None)
+                outcome.output_tokens = getattr(usage, "output_tokens", None)
+
             if message.content and len(message.content) > 0:
-                # content是TextBlock列表
                 text_content = ""
                 for block in message.content:
-                    if hasattr(block, 'text'):
+                    if hasattr(block, "text"):
                         text_content += block.text
-                return text_content
+                outcome.text = text_content or None
 
-            return None
+            return outcome
 
         except anthropic.APIConnectionError as e:
             logger.error(f"Claude API connection error: {e}")
-            return None
+            outcome.failure_stage = "claude_request"
+            outcome.error_message = str(e)
+            return outcome
         except anthropic.RateLimitError as e:
             logger.error(f"Claude API rate limit error: {e}")
-            return None
+            outcome.failure_stage = "claude_request"
+            outcome.error_message = str(e)
+            return outcome
         except anthropic.APIStatusError as e:
             logger.error(f"Claude API status error: {e}")
-            return None
+            outcome.failure_stage = "claude_request"
+            outcome.http_status = getattr(e, "status_code", None)
+            outcome.error_message = str(e)
+            return outcome
         except Exception as e:
             logger.error(f"Unexpected error calling Claude API: {e}", exc_info=True)
-            return None
+            outcome.failure_stage = "claude_request"
+            outcome.error_message = str(e)
+            return outcome
 
     # ------------------------------------------------------------------
-    # Cursor Cloud Agent  (REST `/v1/agents`)
+    # Cursor Cloud Agent  (REST `/v1/agents` — v1 public beta schema)
     # ------------------------------------------------------------------
-    # 终态字段名可能因 Cursor 版本而异, 这里做宽松匹配 (大写后判断关键字)
-    _AGENT_DONE_STATES = {"FINISHED", "COMPLETED", "DONE", "SUCCESS", "SUCCEEDED"}
-    _AGENT_FAIL_STATES = {"ERROR", "FAILED", "CANCELLED", "CANCELED", "ABORTED"}
+    _RUN_DONE_STATES = {"FINISHED", "COMPLETED", "DONE", "SUCCESS", "SUCCEEDED"}
+    _RUN_FAIL_STATES = {"ERROR", "FAILED", "CANCELLED", "CANCELED", "ABORTED"}
 
-    def _call_cursor_agent(self, prompt: str) -> Optional[str]:
+    def _build_cursor_create_payload(self, prompt: str) -> Dict[str, Any]:
         """
-        通过 Cursor Cloud Agents REST API 起一个 agent 任务并轮询拿结果。
+        构造 POST /v1/agents 请求体（v1 要求 prompt/model 为 object，仓库用 repos[]）。
+        """
+        payload: Dict[str, Any] = {
+            "prompt": {"text": prompt},
+        }
+        model_id = (self.cursor_model or "").strip()
+        if model_id and model_id.lower() != "auto":
+            payload["model"] = {"id": model_id}
+
+        repo_url = (self.cursor_repo_url or "").strip()
+        if repo_url:
+            if not repo_url.startswith("http"):
+                repo_url = f"https://github.com/{repo_url.strip('/')}"
+            payload["repos"] = [
+                {
+                    "url": repo_url,
+                    "startingRef": self.cursor_repo_ref or "master",
+                }
+            ]
+        return payload
+
+    @staticmethod
+    def _parse_cursor_create_response(created: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        """从 create 响应解析 agent_id、run_id（兼容 v1 {agent, run} 与旧扁平结构）。"""
+        agent = created.get("agent") if isinstance(created.get("agent"), dict) else created
+        run = created.get("run") if isinstance(created.get("run"), dict) else {}
+        agent_id = (
+            agent.get("id")
+            or created.get("id")
+            or created.get("agent_id")
+        )
+        run_id = (
+            run.get("id")
+            or agent.get("latestRunId")
+            or created.get("run_id")
+            or created.get("latestRunId")
+        )
+        return agent_id, run_id
+
+    def _collect_cursor_run_text(
+        self, client: Any, base: str, headers: Dict[str, str], agent_id: str, run_id: str
+    ) -> str:
+        """通过 GET .../runs/{runId}/stream 收集 assistant 文本增量。"""
+        url = f"{base}/{agent_id}/runs/{run_id}/stream"
+        stream_headers = {**headers, "Accept": "text/event-stream"}
+        parts: List[str] = []
+        event_type: Optional[str] = None
+        try:
+            with client.stream(
+                "GET",
+                url,
+                headers=stream_headers,
+                timeout=settings.CURSOR_AGENT_TIMEOUT,
+            ) as resp:
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Cursor run stream unavailable: agent=%s run=%s HTTP %s %s",
+                        agent_id,
+                        run_id,
+                        resp.status_code,
+                        resp.text[:300],
+                    )
+                    return ""
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        event_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if event_type == "assistant" and data_str:
+                            try:
+                                data = json.loads(data_str)
+                                if isinstance(data, dict):
+                                    parts.append(data.get("text") or "")
+                            except json.JSONDecodeError:
+                                parts.append(data_str)
+                        elif event_type in ("done", "result"):
+                            break
+        except Exception as e:
+            logger.warning("Cursor run stream read error: %s", e)
+        return "".join(parts)
+
+    def _call_cursor_agent(self, prompt: str) -> LlmInvokeOutcome:
+        """
+        通过 Cursor Cloud Agents REST API 创建 agent + run，轮询 run 状态并拉取输出。
 
         Args:
             prompt: 提示词
 
         Returns:
-            最后一段 assistant 文本; 失败 / 超时 / 解析异常时返回 None。
+            LlmInvokeOutcome 含 assistant 文本与 agent/run 元数据
         """
         import httpx
 
+        outcome = LlmInvokeOutcome()
         base = settings.CURSOR_API_BASE.rstrip("/")
         headers = {
             "Authorization": f"Bearer {self.cursor_api_key}",
             "Content-Type": "application/json",
         }
-        payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "model": self.cursor_model,
-        }
-        if self.cursor_repo_url:
-            payload["source"] = {
-                "repository": self.cursor_repo_url,
-                "ref": self.cursor_repo_ref or "master",
-            }
+        payload = self._build_cursor_create_payload(prompt)
 
         try:
-            with httpx.Client(timeout=30) as client:
-                # 1) 创建 agent
-                r = client.post(base, headers=headers, json=payload)
-                if r.status_code >= 400:
-                    logger.error(f"Cursor agent create failed: HTTP {r.status_code} body={r.text[:500]}")
-                    return None
-                created = r.json() if r.content else {}
-                agent_id = created.get("id") or created.get("agent_id")
-                if not agent_id:
-                    logger.error(f"Cursor agent create returned no id: {created}")
-                    return None
-                logger.info(f"Cursor agent created: id={agent_id}")
+            with httpx.Client(timeout=60) as client:
+                create_resp = client.post(base, headers=headers, json=payload)
+                if create_resp.status_code >= 400:
+                    logger.error(
+                        "Cursor agent create failed: HTTP %s body=%s",
+                        create_resp.status_code,
+                        create_resp.text[:500],
+                    )
+                    outcome.failure_stage = "create_agent"
+                    outcome.http_status = create_resp.status_code
+                    outcome.error_message = create_resp.text[:500]
+                    return outcome
 
-                # 2) 轮询
+                created = create_resp.json() if create_resp.content else {}
+                agent_id, run_id = self._parse_cursor_create_response(created)
+                if not agent_id or not run_id:
+                    logger.error("Cursor agent create missing id: %s", created)
+                    outcome.failure_stage = "create_agent"
+                    outcome.error_message = f"missing agent_id/run_id in response: {created}"
+                    return outcome
+
+                outcome.agent_id = str(agent_id)
+                outcome.run_id = str(run_id)
+                logger.info("Cursor agent created: agent_id=%s run_id=%s", agent_id, run_id)
+
                 deadline = time.time() + settings.CURSOR_AGENT_TIMEOUT
-                last_status = None
+                last_status: Optional[str] = None
                 while time.time() < deadline:
-                    poll = client.get(f"{base}/{agent_id}", headers=headers)
+                    poll = client.get(
+                        f"{base}/{agent_id}/runs/{run_id}",
+                        headers=headers,
+                    )
                     if poll.status_code >= 400:
                         logger.error(
-                            f"Cursor agent poll failed: id={agent_id} HTTP {poll.status_code} "
-                            f"body={poll.text[:500]}"
+                            "Cursor run poll failed: agent=%s run=%s HTTP %s %s",
+                            agent_id,
+                            run_id,
+                            poll.status_code,
+                            poll.text[:500],
                         )
-                        return None
+                        outcome.failure_stage = "poll"
+                        outcome.http_status = poll.status_code
+                        outcome.error_message = poll.text[:500]
+                        outcome.run_status = last_status
+                        return outcome
+
                     body = poll.json() if poll.content else {}
-                    status_raw = body.get("status") or body.get("state") or ""
-                    status = str(status_raw).upper()
+                    status = str(body.get("status") or "").upper()
                     if status != last_status:
-                        logger.info(f"Cursor agent status: id={agent_id} status={status}")
+                        logger.info(
+                            "Cursor run status: agent=%s run=%s status=%s",
+                            agent_id,
+                            run_id,
+                            status,
+                        )
                         last_status = status
-                    if status in self._AGENT_DONE_STATES:
-                        return self._extract_cursor_response(body)
-                    if status in self._AGENT_FAIL_STATES:
-                        logger.error(f"Cursor agent failed: id={agent_id} status={status} body={str(body)[:500]}")
-                        return None
+
+                    if status in self._RUN_DONE_STATES:
+                        outcome.run_status = status
+                        text = self._collect_cursor_run_text(
+                            client, base, headers, agent_id, run_id
+                        )
+                        if text.strip():
+                            outcome.text = text
+                            return outcome
+                        fallback = self._extract_cursor_response(body)
+                        outcome.text = fallback
+                        if not fallback:
+                            outcome.failure_stage = "stream"
+                            outcome.error_message = "Run finished but no extractable text"
+                        return outcome
+
+                    if status in self._RUN_FAIL_STATES:
+                        logger.error(
+                            "Cursor run failed: agent=%s run=%s status=%s body=%s",
+                            agent_id,
+                            run_id,
+                            status,
+                            str(body)[:500],
+                        )
+                        outcome.run_status = status
+                        outcome.failure_stage = "poll"
+                        outcome.error_message = str(body)[:500]
+                        return outcome
+
                     time.sleep(settings.CURSOR_AGENT_POLL_INTERVAL)
 
                 logger.error(
-                    f"Cursor agent timeout: id={agent_id} after {settings.CURSOR_AGENT_TIMEOUT}s, last_status={last_status}"
+                    "Cursor run timeout: agent=%s run=%s after %ss last_status=%s",
+                    agent_id,
+                    run_id,
+                    settings.CURSOR_AGENT_TIMEOUT,
+                    last_status,
                 )
-                return None
+                outcome.failure_stage = "timeout"
+                outcome.run_status = last_status
+                outcome.error_message = (
+                    f"Timeout after {settings.CURSOR_AGENT_TIMEOUT}s last_status={last_status}"
+                )
+                return outcome
         except httpx.HTTPError as e:
             logger.error(f"Cursor agent HTTP error: {e}", exc_info=True)
-            return None
+            outcome.failure_stage = "create_agent"
+            outcome.error_message = str(e)
+            return outcome
         except Exception as e:
             logger.error(f"Cursor agent unexpected error: {e}", exc_info=True)
-            return None
+            outcome.failure_stage = "create_agent"
+            outcome.error_message = str(e)
+            return outcome
 
     @staticmethod
     def _extract_cursor_response(body: Dict[str, Any]) -> Optional[str]:

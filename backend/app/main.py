@@ -75,12 +75,14 @@ app.add_middleware(
 # 导入并注册路由
 # 注意：这些路由模块将在后续任务中实现
 try:
-    from app.api import analyze, report, webhook, github
+    from app.api import analyze, report, webhook, github, modules, ai_invocation
 
     app.include_router(analyze.router, prefix="/api", tags=["analyze"])
     app.include_router(report.router, prefix="/api", tags=["report"])
     app.include_router(webhook.router, prefix="/api/webhook", tags=["webhook"])
+    app.include_router(modules.router, prefix="/api", tags=["modules"])
     app.include_router(github.router, prefix="/api", tags=["github"])
+    app.include_router(ai_invocation.router, prefix="/api", tags=["ai-invocation"])
 except ImportError as e:
     logger.warning(f"Some API routers not available yet: {e}")
 

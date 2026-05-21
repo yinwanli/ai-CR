@@ -61,28 +61,64 @@ api.interceptors.response.use(
 
 /**
  * Analyze a release
- * @param {Object|string} payload - release_no string or { release_no, head_sha, base_sha }
+ * @param {Object|string} payload - release_no string or {
+ *   release_no, head_sha, base_sha, compare_mode, branch
+ * }
  * @returns {Promise} Task creation result
  */
 export function analyze(payload) {
-  const body =
-    typeof payload === 'string'
-      ? { release_no: payload }
-      : {
-          release_no: payload.release_no,
-          head_sha: payload.head_sha || null,
-          base_sha: payload.base_sha || null
-        }
-  return api.post('/analyze', body)
+  return api.post('/analyze', {
+    module_id: payload.module_id,
+    release_no: payload.release_no,
+    head_sha: payload.head_sha || null,
+    base_sha: payload.base_sha || null,
+    compare_mode: payload.compare_mode || 'prev_commit',
+    branch: payload.branch || null
+  })
+}
+
+/** 代码模块列表 */
+export function getCodeModules() {
+  return api.get('/code-modules')
 }
 
 /**
- * List commits on a GitHub branch (for release version dropdown)
- * @param {string} branch - branch name
- * @returns {Promise} { repo, branch, commits: [...] }
+ * 指定模块的分支列表
+ * @param {string} moduleId
  */
-export function getGithubCommits(branch) {
-  return api.get('/github/commits', { params: branch ? { branch } : {} })
+export function getGithubBranches(moduleId) {
+  return api.get('/github/branches', { params: { module_id: moduleId } })
+}
+
+/**
+ * 指定模块、分支的 commit 列表
+ * @param {string} moduleId
+ * @param {string} branch
+ */
+export function getGithubCommits(moduleId, branch) {
+  const params = { module_id: moduleId }
+  if (branch) params.branch = branch
+  return api.get('/github/commits', { params })
+}
+
+/**
+ * 从 analyze 响应解析 task_id
+ */
+export function extractTaskId(res) {
+  if (res == null) return null
+  const inner =
+    typeof res === 'object' && res.code !== undefined && res.data !== undefined
+      ? res.data
+      : res
+  if (!inner || typeof inner !== 'object') return null
+  const id = inner.task_id ?? inner.taskId ?? inner.id
+  if (id != null && id !== '' && String(id) !== 'undefined') return id
+  const url = inner.report_url
+  if (typeof url === 'string') {
+    const m = url.match(/\/report\/(\d+)/)
+    if (m) return m[1]
+  }
+  return null
 }
 
 /**

@@ -1,14 +1,14 @@
 """
-GitHub 相关 API：分支提交列表（含上一版本 SHA）。
+GitHub 相关 API：按代码模块级联提供分支、提交列表。
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import verify_token
 from app.schemas.response import Response
-from app.services.github_service import github_service
-from app.config import settings
+from app.services.code_module_service import get_code_module, get_default_module
+from app.services.github_service import GitHubService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -16,35 +16,72 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
-@router.get("/github/commits", response_model=Response)
-async def list_branch_commits(
-    branch: Optional[str] = Query(None, description="分支名，默认 GITHUB_DEFAULT_BRANCH"),
-    repo: Optional[str] = Query(None, description="owner/repo，Demo 后由 Jira 传入；默认配置项"),
+def _resolve_module(module_id: Optional[str]):
+    module = get_code_module(module_id) if module_id else get_default_module()
+    if not module:
+        raise HTTPException(status_code=400, detail="Unknown or missing code module")
+    gh = GitHubService.for_module(module)
+    if not gh.is_configured:
+        raise HTTPException(status_code=500, detail="Invalid module repo configuration")
+    return module, gh
+
+
+@router.get("/github/branches", response_model=Response)
+async def list_repo_branches(
+    module_id: Optional[str] = Query(None, description="代码模块 ID"),
     token: str = Depends(verify_token),
 ):
-    """
-    获取指定分支的提交列表，用于首页发布版本下拉。
-    每条记录包含 base_sha（分支上上一版），便于「本版 vs 上一版」对比分析。
-    """
+    """获取指定模块仓库的分支列表。"""
     try:
-        if not github_service.is_configured:
-            return Response(code=500, message="GITHUB_REPO is not configured", data=[])
-
-        # repo 参数预留供 Jira 多仓库；Demo 使用 .env 中的 GITHUB_REPO
-        if repo and repo.strip() and repo.strip() != settings.GITHUB_REPO:
-            logger.info("github/commits: repo param %s ignored in demo, using %s", repo, settings.GITHUB_REPO)
-
-        commits = github_service.list_commits(branch=branch)
-
+        module, gh = _resolve_module(module_id)
+        branches = gh.list_branches()
         return Response(
             code=0,
             message="success",
             data={
-                "repo": settings.GITHUB_REPO,
-                "branch": branch or settings.GITHUB_DEFAULT_BRANCH,
+                "module_id": module.id,
+                "module_name": module.name,
+                "repo": module.repo,
+                "default_branch": module.default_branch,
+                "baseline_branch": module.baseline_branch,
+                "branches": branches,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to list branches: %s", e, exc_info=True)
+        return Response(code=500, message=str(e), data={"branches": []})
+
+
+@router.get("/github/commits", response_model=Response)
+async def list_branch_commits(
+    module_id: Optional[str] = Query(None, description="代码模块 ID"),
+    branch: Optional[str] = Query(None, description="分支名，默认模块的 default_branch"),
+    token: str = Depends(verify_token),
+):
+    """
+    获取指定模块、分支上的提交列表。
+    每条含 base_sha（分支时间线上一提交），用于相邻提交对比。
+    """
+    try:
+        module, gh = _resolve_module(module_id)
+        active_branch = (branch or module.default_branch).strip()
+        commits = gh.list_commits(branch=active_branch)
+        return Response(
+            code=0,
+            message="success",
+            data={
+                "module_id": module.id,
+                "module_name": module.name,
+                "repo": module.repo,
+                "branch": active_branch,
+                "baseline_branch": module.baseline_branch,
                 "commits": commits,
             },
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to list GitHub commits: %s", e, exc_info=True)
         return Response(code=500, message=str(e), data={"commits": []})

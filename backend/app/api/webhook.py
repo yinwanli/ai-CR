@@ -15,6 +15,7 @@ from app.config import settings
 from app.services.jira_service import jira_service
 from app.services.diff_parser import diff_parser
 from app.services.ai_analyzer import ai_analyzer
+from app.services.ai_invocation_context import InvocationContext
 from app.models.report import AnalysisReport
 from app.utils.logger import get_logger
 
@@ -178,7 +179,17 @@ def run_analysis(
 
         # 5. 调用AI分析
         logger.info("Calling AI analyzer...")
-        analysis_result = ai_analyzer.analyze(requirement_doc, diff_content)
+        invocation_context = InvocationContext(
+            task_id=task_id,
+            release_no=release_no,
+            jira_key=jira_key,
+            caller_source="webhook",
+        )
+        analysis_result = ai_analyzer.analyze(
+            requirement_doc,
+            diff_content,
+            invocation_context=invocation_context,
+        )
 
         if not analysis_result:
             logger.error("AI analysis returned empty result")

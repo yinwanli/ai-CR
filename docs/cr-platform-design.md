@@ -159,13 +159,33 @@ backend/
 
 #### 3.2.1 提交分析任务
 
+**前端级联顺序（已实现 Demo）**
+
+1. 代码模块 `GET /api/code-modules`
+2. 分支 `GET /api/github/branches?module_id=`
+3. 对比范围 `compare_mode`：`prev_commit` | `vs_master`
+4. 发布版本 `GET /api/github/commits?module_id=&branch=`
+
 **Request**
 ```json
 POST /api/analyze
 {
-    "release_no": "REL-20240517-PROJ-123"
+    "module_id": "yinwanli-ai-cr",
+    "release_no": "b224576",
+    "head_sha": "abc123...",
+    "base_sha": "def456...",
+    "compare_mode": "prev_commit",
+    "branch": "feature/my-change"
 }
 ```
+
+`compare_mode`：
+- `prev_commit`（默认）：本提交 vs **分支时间线上一提交**
+- `vs_master`：本提交 vs **模块配置的 baseline_branch**（如 main/master）
+
+任务存储键：`{module_id}:{release_no}` 或 `{module_id}:{release_no}@vs-master`。
+
+Demo 模块来自 `.env` 的 `GITHUB_REPO`；生产用 `CODE_MODULES_JSON` 配置多模块。
 
 **Response**
 ```json

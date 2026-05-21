@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..config import settings
+from .code_module_service import CodeModule
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +26,33 @@ def _is_configured_token(token: str) -> bool:
 class GitHubService:
     """封装 GitHub REST API（公开库可无 Token）。"""
 
-    def __init__(self) -> None:
-        self.repo = settings.GITHUB_REPO.strip()
-        self.default_branch = settings.GITHUB_DEFAULT_BRANCH.strip() or "main"
+    def __init__(
+        self,
+        *,
+        repo: Optional[str] = None,
+        default_branch: Optional[str] = None,
+        master_branch: Optional[str] = None,
+    ) -> None:
+        self.repo = (repo or settings.GITHUB_REPO).strip()
+        self.default_branch = (default_branch or settings.GITHUB_DEFAULT_BRANCH).strip() or "main"
+        master = (master_branch or settings.GITHUB_MASTER_BRANCH or "").strip()
+        self.master_branch = master or self.default_branch
         self.token = settings.GITHUB_TOKEN.strip()
         self.commits_limit = settings.GITHUB_COMMITS_LIMIT
+        self.branches_limit = settings.GITHUB_BRANCHES_LIMIT
         self._owner: Optional[str] = None
         self._name: Optional[str] = None
         if "/" in self.repo:
             parts = self.repo.split("/", 1)
             self._owner, self._name = parts[0], parts[1]
+
+    @classmethod
+    def for_module(cls, module: CodeModule) -> "GitHubService":
+        return cls(
+            repo=module.repo,
+            default_branch=module.default_branch,
+            master_branch=module.baseline_branch,
+        )
 
     @property
     def is_configured(self) -> bool:
@@ -72,6 +90,21 @@ class GitHubService:
                 )
             return resp.json() if resp.content else {}
 
+    def list_branches(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
+        """列出仓库分支（名称）。"""
+        per_page = min(limit or self.branches_limit, 100)
+        path = f"/repos/{self._owner}/{self._name}/branches"
+        raw = self._request("GET", path, params={"per_page": per_page})
+        if not isinstance(raw, list):
+            return []
+        names = []
+        for b in raw:
+            name = b.get("name") if isinstance(b, dict) else None
+            if name:
+                names.append({"name": name})
+        names.sort(key=lambda x: x["name"])
+        return names
+
     def list_commits(
         self,
         branch: Optional[str] = None,
@@ -107,9 +140,6 @@ class GitHubService:
                     "date": date,
                     "base_sha": base_sha,
                     "branch": branch,
-                    "compare_label": (
-                        f"{short_sha} vs {base_sha[:7]}" if base_sha else f"{short_sha} (首个提交)"
-                    ),
                 }
             )
         return items
@@ -165,7 +195,7 @@ class GitHubService:
         branch: Optional[str] = None,
     ) -> Tuple[str, str, str]:
         """
-        本版本相对上一版的 diff。
+        本版本相对分支上一提交的 diff。
 
         Returns:
             (diff_text, resolved_head_sha, resolved_base_sha)
@@ -181,6 +211,36 @@ class GitHubService:
         diff_text = self.get_compare_diff(base, head)
         if not diff_text.strip():
             logger.warning("Compare returned empty diff for %s...%s", base[:7], head[:7])
+        return diff_text, head, base
+
+    def resolve_branch_tip(self, branch: Optional[str] = None) -> str:
+        """解析分支当前 tip 的完整 commit SHA（用于 master 基线）。"""
+        ref = (branch or self.master_branch).strip()
+        return self.resolve_head_sha(ref)
+
+    def get_vs_master_diff(
+        self,
+        head_sha: str,
+        *,
+        branch: Optional[str] = None,
+        master_branch: Optional[str] = None,
+    ) -> Tuple[str, str, str]:
+        """
+        功能分支（或指定 head）相对 master/main 基线分支 tip 的 diff。
+
+        Returns:
+            (diff_text, resolved_head_sha, resolved_base_sha)
+        """
+        head = self.resolve_head_sha(head_sha) if len(head_sha) < 40 else head_sha
+        base = self.resolve_branch_tip(master_branch or self.master_branch)
+        diff_text = self.get_compare_diff(base, head)
+        if not diff_text.strip():
+            logger.warning(
+                "Compare vs master returned empty diff for %s...%s (branch=%s)",
+                base[:7],
+                head[:7],
+                branch or self.default_branch,
+            )
         return diff_text, head, base
 
 

@@ -44,8 +44,13 @@ class Settings(BaseSettings):
     # GitHub（发布版本 / diff）
     GITHUB_REPO: str = "yinwanli/ai-CR"
     GITHUB_DEFAULT_BRANCH: str = "main"
+    GITHUB_MASTER_BRANCH: str = ""  # 空则与 GITHUB_DEFAULT_BRANCH 相同，用于 vs_master 基线
     GITHUB_TOKEN: str = ""
     GITHUB_COMMITS_LIMIT: int = 30
+    GITHUB_BRANCHES_LIMIT: int = 30
+    # 代码模块列表 JSON（生产多仓库）；空则使用 GITHUB_REPO 派生单模块
+    # 例: [{"id":"ai-cr","name":"AI CR","repo":"org/repo","default_branch":"main","baseline_branch":"main"}]
+    CODE_MODULES_JSON: str = ""
 
     # 认证配置
     AUTH_TOKEN: str = "demo-token"
